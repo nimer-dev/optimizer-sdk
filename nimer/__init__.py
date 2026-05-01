@@ -30,7 +30,11 @@ from .exceptions import ConfigurationError, NimerError, RoutingError
 from .pricing import estimate_cost, estimate_savings
 from .router import Router
 
+# Drop-in alias: `from nimer import Anthropic` replaces `from anthropic import Anthropic`
+Anthropic = OptimizedClaude
+
 __all__ = [
+    "Anthropic",
     "OptimizedClaude",
     "Router",
     "estimate_cost",

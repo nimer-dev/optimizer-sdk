@@ -70,7 +70,11 @@ class OptimizedClaude:
         **kwargs: Any,
     ) -> Any:
         # Decide which model to actually call.
-        if auto_route and model is None:
+        # When auto_route=True the router always wins — the user's `model`
+        # becomes the logged "requested_model" only. This is the core product
+        # promise: same call, smarter (cheaper) model automatically.
+        # Pass auto_route=False to pin a specific model.
+        if auto_route:
             chosen_model = self._router.choose(messages, system=system)
         else:
             chosen_model = model or BASELINE_MODEL
