@@ -149,7 +149,9 @@ Saudi Arabia. Building globally.
 
 ## Founder
 
-Built by [Majdi](https://twitter.com/trynimer) — a developer who watched his Claude API bill climb past $400/month and built a router to fix it. Named after his son Nimer, because the best things you build are for the people you love.
+Built by [Majdi](https://twitter.com/trynimer) — a developer who turns problems into products. Started by watching his Claude API bill climb past $400/month and building a router to fix it. Named after his son Nimer, because the best things you build are for the people you love.
+
+This is the first product. Not the last.
 
 ⭐ Star this repo if you've ever overspent on Claude API.
 
