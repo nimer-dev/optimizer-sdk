@@ -149,7 +149,9 @@ Saudi Arabia. Building globally.
 
 ## Founder
 
-Built by [Nimer](https://twitter.com/nimerdev) — a service engineer who taught himself Python in two months, watched his Claude API bill climb past $400/month, and built a router to fix it. Now turning it into a product, in public.
+Built by [Nimer](https://twitter.com/trynimer) — someone who's been taking apart computers and putting them back together since childhood. Started with hardware: building rigs, swapping GPUs, pushing machines to their limits. Moved into software the same way — by actually doing it, including writing low-level code to unlock encrypted satellite streams just to watch a football match.
+
+That same instinct — find the inefficiency, engineer around it — led to Nimer. Watched a Claude API bill climb past $400/month, understood exactly why, and built a router to fix it. Now turning it into a product, in public.
 
 ⭐ Star this repo if you've ever overspent on Claude API.
 
