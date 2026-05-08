@@ -11,3 +11,7 @@ class ConfigurationError(NimerError):
 
 class RoutingError(NimerError):
     """Raised when routing logic cannot select a valid model."""
+
+
+class TrustGatewayError(NimerError):
+    """Raised when AI Quality & Trust Gateway blocks a response."""

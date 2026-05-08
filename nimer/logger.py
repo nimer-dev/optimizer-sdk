@@ -30,7 +30,9 @@ class UsageLogger:
         timeout_seconds: float = 2.0,
     ) -> None:
         self._api_key = api_key
-        self._url = f"{base_url.rstrip('/')}/v1/usage"
+        root = base_url.rstrip("/")
+        self._usage_url = f"{root}/v1/usage"
+        self._trust_url = f"{root}/v1/trust"
         self._timeout = timeout_seconds
 
     def log_async(
@@ -64,7 +66,7 @@ class UsageLogger:
     def _send(self, payload: dict[str, Any]) -> None:
         try:
             httpx.post(
-                self._url,
+                self._usage_url,
                 json=payload,
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 timeout=self._timeout,
@@ -72,3 +74,49 @@ class UsageLogger:
         except Exception as exc:  # pragma: no cover - defensive
             # Logging must never crash the host process. Whisper, don't shout.
             logger.debug("Nimer usage log failed: %s", exc)
+
+    def log_trust_async(
+        self,
+        *,
+        requested_model: str | None,
+        actual_model: str,
+        report: dict[str, Any],
+        blocked_by_gateway: bool,
+        fallback_attempts: int,
+    ) -> None:
+        payload = {
+            "ts": time.time(),
+            "requested_model": requested_model,
+            "actual_model": actual_model,
+            "is_valid": bool(report.get("is_valid", True)),
+            "is_safe": bool(report.get("is_safe", True)),
+            "is_biased": bool(report.get("is_biased", False)),
+            "has_pii": bool(report.get("has_pii", False)),
+            "is_toxic": bool(report.get("is_toxic", False)),
+            "safety_score": float(report.get("safety_score", 100.0) or 100.0),
+            "blocked_by_gateway": blocked_by_gateway,
+            "input_tokens": int(report.get("input_tokens", 0) or 0),
+            "output_tokens": int(report.get("output_tokens", 0) or 0),
+            "total_tokens": int(report.get("total_tokens", 0) or 0),
+            "latency_ms": float(report.get("latency_ms", 0.0) or 0.0),
+            "fallback_attempts": max(fallback_attempts, 0),
+            "issues": report.get("issues", []),
+        }
+        thread = threading.Thread(
+            target=self._send_trust,
+            args=(payload,),
+            daemon=True,
+            name="nimer-trust-logger",
+        )
+        thread.start()
+
+    def _send_trust(self, payload: dict[str, Any]) -> None:
+        try:
+            httpx.post(
+                self._trust_url,
+                json=payload,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=self._timeout,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Nimer trust log failed: %s", exc)
