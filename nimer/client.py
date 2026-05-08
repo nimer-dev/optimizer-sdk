@@ -16,7 +16,7 @@ import os
 import time
 from typing import Any
 
-from anthropic import Anthropic
+from anthropic import Anthropic, AsyncAnthropic
 
 from ._constants import BASELINE_MODEL, MODEL_HAIKU, MODEL_OPUS, MODEL_SONNET
 from .ai_quality_gateway import AIQualityTrustGateway
@@ -229,3 +229,96 @@ class _MessagesProxy:
             system=system,
             **kwargs,
         )
+
+    def stream(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        auto_route: bool = True,
+        model: str | None = None,
+        system: str | list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        chosen_model = self._client._router.choose(messages, system=system) if auto_route else (model or BASELINE_MODEL)
+        forward_kwargs: dict[str, Any] = {"model": chosen_model, "messages": messages, **kwargs}
+        if system is not None:
+            forward_kwargs["system"] = system
+        return self._client._anthropic.messages.stream(**forward_kwargs)
+
+
+class AsyncNimer:
+    """Async version of OptimizedClaude with routing + stream support."""
+
+    def __init__(
+        self,
+        anthropic_api_key: str | None = None,
+        nimer_api_key: str | None = None,
+        *,
+        base_url: str = "https://api.nimer.dev",
+        router: Router | None = None,
+    ) -> None:
+        anthropic_api_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not anthropic_api_key:
+            raise ConfigurationError(
+                "anthropic_api_key is required (or set ANTHROPIC_API_KEY env var)."
+            )
+        nimer_api_key = nimer_api_key or os.getenv("NIMER_API_KEY")
+        self._anthropic = AsyncAnthropic(api_key=anthropic_api_key)
+        self._router = router or Router()
+        self._usage_logger: UsageLogger | None = (
+            UsageLogger(api_key=nimer_api_key, base_url=base_url) if nimer_api_key else None
+        )
+        self.messages = _AsyncMessagesProxy(self)
+
+
+class _AsyncMessagesProxy:
+    def __init__(self, client: AsyncNimer) -> None:
+        self._client = client
+
+    async def create(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        auto_route: bool = True,
+        model: str | None = None,
+        system: str | list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        chosen_model = self._client._router.choose(messages, system=system) if auto_route else (model or BASELINE_MODEL)
+        forward_kwargs: dict[str, Any] = {"model": chosen_model, "messages": messages, **kwargs}
+        if system is not None:
+            forward_kwargs["system"] = system
+        response = await self._client._anthropic.messages.create(**forward_kwargs)
+        if self._client._usage_logger is not None:
+            usage = getattr(response, "usage", None)
+            input_tokens = getattr(usage, "input_tokens", 0) or 0
+            output_tokens = getattr(usage, "output_tokens", 0) or 0
+            savings = estimate_savings(
+                actual_model=chosen_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+            self._client._usage_logger.log_async(
+                requested_model=model,
+                actual_model=chosen_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                estimated_savings_usd=savings,
+                auto_routed=(auto_route and model is None),
+            )
+        return response
+
+    def stream(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        auto_route: bool = True,
+        model: str | None = None,
+        system: str | list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        chosen_model = self._client._router.choose(messages, system=system) if auto_route else (model or BASELINE_MODEL)
+        forward_kwargs: dict[str, Any] = {"model": chosen_model, "messages": messages, **kwargs}
+        if system is not None:
+            forward_kwargs["system"] = system
+        return self._client._anthropic.messages.stream(**forward_kwargs)
