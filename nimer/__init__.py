@@ -24,9 +24,10 @@ from ._constants import (
     MODEL_SONNET,
     SUPPORTED_MODELS,
 )
+from .ai_quality_gateway import AIQualityTrustGateway, GatewayIssue, GatewayPolicy, GatewayReport
 from ._version import __version__
-from .client import OptimizedClaude
-from .exceptions import ConfigurationError, NimerError, RoutingError
+from .client import AsyncNimer, OptimizedClaude
+from .exceptions import ConfigurationError, NimerError, RoutingError, TrustGatewayError
 from .pricing import estimate_cost, estimate_savings
 from .router import Router
 
@@ -36,6 +37,7 @@ Anthropic = OptimizedClaude
 __all__ = [
     "Anthropic",
     "OptimizedClaude",
+    "AsyncNimer",
     "Router",
     "estimate_cost",
     "estimate_savings",
@@ -47,5 +49,10 @@ __all__ = [
     "NimerError",
     "ConfigurationError",
     "RoutingError",
+    "TrustGatewayError",
+    "AIQualityTrustGateway",
+    "GatewayIssue",
+    "GatewayPolicy",
+    "GatewayReport",
     "__version__",
 ]
