@@ -59,6 +59,10 @@ class OptimizedClaude:
         self._trust_gateway = trust_gateway or AIQualityTrustGateway()
         self._nimer_api_key = nimer_api_key
         self._nimer_base_url = base_url.rstrip("/")
+        # Persistent HTTP client for /v1/chat and /v1/ultrathink so we
+        # reuse the TLS connection across calls instead of paying for a
+        # fresh handshake every request.
+        self._http: httpx.Client | None = None
         self._usage_logger: UsageLogger | None = (
             UsageLogger(api_key=nimer_api_key, base_url=base_url)
             if nimer_api_key
@@ -67,6 +71,35 @@ class OptimizedClaude:
 
         # Mirror anthropic.Anthropic's `.messages.create(...)` shape.
         self.messages = _MessagesProxy(self)
+
+    # Context-manager support so callers can do `with OptimizedClaude(...)`
+    # and get deterministic socket cleanup on exit.
+    def __enter__(self) -> "OptimizedClaude":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release the persistent httpx client. Safe to call multiple times."""
+        if self._http is not None:
+            try:
+                self._http.close()
+            except Exception:
+                pass
+            self._http = None
+
+    def _get_http(self, timeout: float) -> httpx.Client:
+        """Lazily create and reuse a single httpx.Client per instance."""
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.Client(
+                timeout=timeout,
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=10,
+                ),
+            )
+        return self._http
 
     # ------------------------------------------------------------------
     # Multi-provider routing — calls the Nimer backend, NOT Anthropic
@@ -143,10 +176,10 @@ class OptimizedClaude:
             "Authorization": f"Bearer {self._nimer_api_key}",
             "Content-Type": "application/json",
         }
-        with httpx.Client(timeout=timeout) as http:
-            response = http.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            return response.json()
+        http = self._get_http(timeout)
+        response = http.post(url, json=payload, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
 
     # ------------------------------------------------------------------
     # Internal — used by the messages proxy
@@ -357,10 +390,39 @@ class AsyncNimer:
         self._trust_gateway = trust_gateway or AIQualityTrustGateway()
         self._nimer_api_key = nimer_api_key
         self._nimer_base_url = base_url.rstrip("/")
+        # Reused across achat/aultrathink so we don't pay for a TLS
+        # handshake on every call.
+        self._http: httpx.AsyncClient | None = None
         self._usage_logger: UsageLogger | None = (
             UsageLogger(api_key=nimer_api_key, base_url=base_url) if nimer_api_key else None
         )
         self.messages = _AsyncMessagesProxy(self)
+
+    async def __aenter__(self) -> "AsyncNimer":
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Release the persistent async httpx client. Safe to call multiple times."""
+        if self._http is not None:
+            try:
+                await self._http.aclose()
+            except Exception:
+                pass
+            self._http = None
+
+    def _get_http(self, timeout: float) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                timeout=timeout,
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=10,
+                ),
+            )
+        return self._http
 
     # ------------------------------------------------------------------
     # Async multi-provider routing — calls the Nimer backend, NOT Anthropic
@@ -408,10 +470,10 @@ class AsyncNimer:
             "Authorization": f"Bearer {self._nimer_api_key}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=timeout) as http:
-            response = await http.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            return response.json()
+        http = self._get_http(timeout)
+        response = await http.post(url, json=payload, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
 
     @staticmethod
     def _next_fallback_model(current_model: str) -> str | None:
