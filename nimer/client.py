@@ -14,14 +14,15 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from typing import Any, AsyncIterator, Iterator
 
 import httpx
 from anthropic import Anthropic, AsyncAnthropic
 
 from ._constants import BASELINE_MODEL, MODEL_HAIKU, MODEL_OPUS, MODEL_SONNET
+from ._streaming import build_payload, parse_sse_line
 from .ai_quality_gateway import AIQualityTrustGateway
-from .exceptions import ConfigurationError, TrustGatewayError
+from .exceptions import ConfigurationError, NimerError, TrustGatewayError
 from .logger import UsageLogger
 from .pricing import estimate_savings
 from .router import Router
@@ -30,6 +31,31 @@ from .router import Router
 # Default timeout for Ultrathink fan-out + synthesis (slower than a single call).
 _ULTRATHINK_TIMEOUT_SECS = 60.0
 _CHAT_TIMEOUT_SECS = 30.0
+# Streaming uses a long read timeout because we hold the connection open while
+# the model generates tokens; the connect timeout stays short so DNS/TLS issues
+# fail fast.
+_STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
+
+
+def _raise_for_stream_error(status: int, body: bytes) -> None:
+    """Convert a non-2xx response from the streaming endpoint into a NimerError.
+
+    The API returns structured `{"detail": ...}` JSON for 4xx/5xx; we forward
+    the message verbatim so users see the same wording as the dashboard.
+    """
+    try:
+        parsed = httpx.Response(status_code=status, content=body).json()
+    except Exception:
+        parsed = body.decode("utf-8", errors="replace")
+    if isinstance(parsed, dict) and "detail" in parsed:
+        detail = parsed["detail"]
+        if isinstance(detail, dict):
+            msg = detail.get("message") or str(detail)
+        else:
+            msg = str(detail)
+    else:
+        msg = str(parsed)
+    raise NimerError(f"Nimer streaming request failed (HTTP {status}): {msg}")
 
 
 class OptimizedClaude:
@@ -125,6 +151,107 @@ class OptimizedClaude:
             payload={"messages": messages, **kwargs},
             timeout=_ULTRATHINK_TIMEOUT_SECS,
         )
+
+    # ------------------------------------------------------------------
+    # Streaming via Nimer's OpenAI-compatible /v1/chat/completions endpoint
+    # ------------------------------------------------------------------
+
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        max_tokens: int = 2048,
+        **extra: Any,
+    ) -> Iterator[dict[str, Any]]:
+        """Stream a chat completion through Nimer (multi-provider, auto-routed).
+
+        Args:
+            messages: list of ``{"role": "user/assistant/system", "content": "..."}``
+            model: explicit model ID from the catalog (e.g. ``"gpt-4o-mini"``,
+                   ``"claude-3-haiku-20240307"``, ``"gemini/gemini-2.5-flash"``).
+                   Omit to let Nimer auto-route to the cheapest model that fits.
+            max_tokens: cap on generated tokens (1..16000). Default 2048.
+            **extra: any other OpenAI-style fields (``temperature``, ``top_p``,
+                     etc.) — forwarded transparently and ignored if a provider
+                     doesn't support them.
+
+        Yields event dicts with one of three shapes:
+
+            ``{"type": "delta", "content": "..."}``
+                Incremental text — most events look like this.
+            ``{"type": "done",  "model": "...", "provider": "...",``
+                ``"input_tokens": int, "output_tokens": int,``
+                ``"auto_routed": bool, "latency_ms": float | None,``
+                ``"finish_reason": "stop" | ...}``
+                Final event after the model is finished.
+            ``{"type": "error", "message": "...", "provider": "...",``
+                ``"raw_error": "...", "model": "..."}``
+                The provider failed mid-stream (rare). Iteration ends after.
+
+        Example::
+
+            for event in client.stream([{"role": "user", "content": "Hi"}]):
+                if event["type"] == "delta":
+                    print(event["content"], end="", flush=True)
+                elif event["type"] == "done":
+                    print(f"\\n[{event['model']}] "
+                          f"{event['input_tokens']}+{event['output_tokens']} tok")
+        """
+        if not self._nimer_api_key:
+            raise ConfigurationError(
+                "nimer_api_key is required for stream() "
+                "(or set NIMER_API_KEY env var)."
+            )
+
+        url = f"{self._nimer_base_url}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self._nimer_api_key}",
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        }
+        payload = build_payload(
+            messages=messages, model=model, max_tokens=max_tokens, extra=extra
+        )
+        with httpx.Client(timeout=_STREAM_TIMEOUT) as http:
+            with http.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    _raise_for_stream_error(resp.status_code, resp.read())
+                for line in resp.iter_lines():
+                    parsed = parse_sse_line(line)
+                    if parsed is None:
+                        continue
+                    if parsed == "DONE":
+                        return
+                    yield parsed  # type: ignore[misc]
+
+    def stream_text(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        max_tokens: int = 2048,
+        **extra: Any,
+    ) -> Iterator[str]:
+        """Convenience wrapper around :meth:`stream` that yields raw text only.
+
+        Skips ``done`` events and surfaces ``error`` events as :class:`NimerError`.
+
+        Example::
+
+            for token in client.stream_text(messages):
+                print(token, end="", flush=True)
+        """
+        for event in self.stream(
+            messages, model=model, max_tokens=max_tokens, **extra
+        ):
+            kind = event.get("type")
+            if kind == "delta":
+                yield event.get("content", "")
+            elif kind == "error":
+                raise NimerError(
+                    event.get("message", "Provider error during stream.")
+                )
 
     def _call_nimer_endpoint(
         self,
@@ -390,6 +517,77 @@ class AsyncNimer:
             payload={"messages": messages, **kwargs},
             timeout=_ULTRATHINK_TIMEOUT_SECS,
         )
+
+    # ------------------------------------------------------------------
+    # Async streaming via Nimer's /v1/chat/completions endpoint
+    # ------------------------------------------------------------------
+
+    async def astream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        max_tokens: int = 2048,
+        **extra: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Async version of :meth:`OptimizedClaude.stream`. See that docstring
+        for the full event shape.
+
+        Example::
+
+            async for event in client.astream([{"role": "user", "content": "Hi"}]):
+                if event["type"] == "delta":
+                    print(event["content"], end="", flush=True)
+        """
+        if not self._nimer_api_key:
+            raise ConfigurationError(
+                "nimer_api_key is required for astream() "
+                "(or set NIMER_API_KEY env var)."
+            )
+
+        url = f"{self._nimer_base_url}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self._nimer_api_key}",
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        }
+        payload = build_payload(
+            messages=messages, model=model, max_tokens=max_tokens, extra=extra
+        )
+        async with httpx.AsyncClient(timeout=_STREAM_TIMEOUT) as http:
+            async with http.stream(
+                "POST", url, json=payload, headers=headers
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    _raise_for_stream_error(resp.status_code, body)
+                async for line in resp.aiter_lines():
+                    parsed = parse_sse_line(line)
+                    if parsed is None:
+                        continue
+                    if parsed == "DONE":
+                        return
+                    yield parsed  # type: ignore[misc]
+
+    async def astream_text(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        max_tokens: int = 2048,
+        **extra: Any,
+    ) -> AsyncIterator[str]:
+        """Async equivalent of :meth:`OptimizedClaude.stream_text`."""
+        async for event in self.astream(
+            messages, model=model, max_tokens=max_tokens, **extra
+        ):
+            kind = event.get("type")
+            if kind == "delta":
+                yield event.get("content", "")
+            elif kind == "error":
+                raise NimerError(
+                    event.get("message", "Provider error during stream.")
+                )
 
     async def _acall_nimer_endpoint(
         self,
