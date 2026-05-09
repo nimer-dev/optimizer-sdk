@@ -46,6 +46,105 @@ response = client.messages.create(
 
 Three lines of config. Automatic routing. Real savings.
 
+### Ready-to-copy snippets
+
+#### Sync
+
+```python
+from nimer import OptimizedClaude
+
+client = OptimizedClaude()
+response = client.messages.create(
+    max_tokens=256,
+    messages=[{"role": "user", "content": "Summarize this in 3 bullets."}],
+)
+print(response.content[0].text)
+```
+
+#### Async
+
+```python
+import asyncio
+from nimer import AsyncNimer
+
+async def main() -> None:
+    client = AsyncNimer()
+    response = await client.messages.create(
+        max_tokens=256,
+        messages=[{"role": "user", "content": "Explain retries in one paragraph."}],
+    )
+    print(response.content[0].text)
+
+asyncio.run(main())
+```
+
+#### Stream (Anthropic passthrough)
+
+```python
+from nimer import OptimizedClaude
+
+client = OptimizedClaude()
+with client.messages.stream(
+    max_tokens=300,
+    messages=[{"role": "user", "content": "Write a launch announcement thread."}],
+) as stream:
+    for text in stream.text_stream:
+        print(text, end="", flush=True)
+```
+
+#### Stream through Nimer (multi-provider, auto-routed)
+
+Streams from whichever provider you've connected — Claude, GPT, Gemini, DeepSeek, etc. — using Nimer's OpenAI-compatible `/v1/chat/completions` endpoint:
+
+```python
+from nimer import OptimizedClaude
+
+client = OptimizedClaude(nimer_api_key="nm_...")
+for event in client.stream(
+    messages=[{"role": "user", "content": "Write a launch announcement thread."}],
+    max_tokens=300,
+    # model="claude-3-haiku-20240307",  # optional — pin a specific model
+):
+    if event["type"] == "delta":
+        print(event["content"], end="", flush=True)
+    elif event["type"] == "done":
+        print(f"\n[{event['model']}] {event['input_tokens']}+{event['output_tokens']} tok")
+```
+
+For an even simpler flow, use `client.stream_text(...)` (yields raw token strings, raises on error). Async variants live on `AsyncNimer` as `astream(...)` / `astream_text(...)`.
+
+#### Tools
+
+```python
+from nimer import OptimizedClaude
+
+client = OptimizedClaude()
+response = client.messages.create(
+    max_tokens=400,
+    tools=[
+        {
+            "name": "get_weather",
+            "description": "Fetch weather by city",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }
+    ],
+    messages=[{"role": "user", "content": "What's weather in Riyadh?"}],
+)
+print(response.content)
+```
+
+### Examples folder
+
+- `examples/basic_usage.py` — minimal sync flow
+- `examples/async_usage.py` — async flow
+- `examples/stream_usage.py` — streaming flow
+- `examples/tools_usage.py` — tool-use flow
+- `examples/routing_demo.py` — cost/savings demo across prompt types
+
 ## Migrating from `anthropic`
 
 Change one import:

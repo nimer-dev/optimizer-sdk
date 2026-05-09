@@ -10,6 +10,7 @@ unreachable Nimer backend never delays the user's actual API call.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import queue
 import threading
@@ -43,6 +44,16 @@ class UsageLogger:
             name="nimer-logger-worker",
         )
         self._worker.start()
+        atexit.register(self._flush)
+
+    def _flush(self) -> None:
+        """Drain remaining queue items on process exit (best-effort, 4s cap)."""
+        deadline = time.time() + 4.0
+        try:
+            while self._queue.unfinished_tasks > 0 and time.time() < deadline:
+                time.sleep(0.05)
+        except Exception:
+            pass
 
     def log_async(
         self,
