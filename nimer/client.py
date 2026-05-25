@@ -22,53 +22,22 @@ import httpx
 from anthropic import Anthropic, AsyncAnthropic
 
 from ._constants import BASELINE_MODEL, MODEL_HAIKU, MODEL_OPUS, MODEL_SONNET
-from ._streaming import build_payload, parse_sse_line
 from .ai_quality_gateway import AIQualityTrustGateway
-from .exceptions import ConfigurationError, NimerError, TrustGatewayError, raise_for_http_status
-from ._http_helpers import arequest_with_policy, otel_trace_headers, request_with_policy
+from .exceptions import ConfigurationError, TrustGatewayError
 from .retry_policy import RetryPolicy
 from .logger import UsageLogger
 from .router import Router
 from .routing_engine import fallback_chain, next_fallback_model
 from ._client_common import (
-    _SecretStr,
-    _as_secret,
+    _CHAT_TIMEOUT_SECS,
+    _NimerBackendCore,
+    _ULTRATHINK_TIMEOUT_SECS,
     _run_messages_create_async,
     _run_messages_create_sync,
 )
 
 
-# Default timeout for Ultrathink fan-out + synthesis (slower than a single call).
-_ULTRATHINK_TIMEOUT_SECS = 60.0
-_CHAT_TIMEOUT_SECS = 30.0
-# Streaming uses a long read timeout because we hold the connection open while
-# the model generates tokens; the connect timeout stays short so DNS/TLS issues
-# fail fast.
-_STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
-
-
-def _raise_for_stream_error(status: int, body: bytes) -> None:
-    """Convert a non-2xx response from the streaming endpoint into a NimerError.
-
-    The API returns structured `{"detail": ...}` JSON for 4xx/5xx; we forward
-    the message verbatim so users see the same wording as the dashboard.
-    """
-    try:
-        parsed = httpx.Response(status_code=status, content=body).json()
-    except Exception:
-        parsed = body.decode("utf-8", errors="replace")
-    if isinstance(parsed, dict) and "detail" in parsed:
-        detail = parsed["detail"]
-        if isinstance(detail, dict):
-            msg = detail.get("message") or str(detail)
-        else:
-            msg = str(detail)
-    else:
-        msg = str(parsed)
-    raise_for_http_status(status, f"Nimer streaming request failed (HTTP {status}): {msg}", detail=parsed)
-
-
-class OptimizedClaude:
+class OptimizedClaude(_NimerBackendCore):
     """Anthropic client with automatic, cost-aware model routing."""
 
     def __init__(
@@ -94,11 +63,13 @@ class OptimizedClaude:
         self._anthropic = Anthropic(api_key=anthropic_api_key)
         self._router = router or Router()
         self._trust_gateway = trust_gateway or AIQualityTrustGateway()
-        self._nimer_api_key: _SecretStr | None = _as_secret(nimer_api_key)
-        self._nimer_base_url = base_url.rstrip("/")
+        self._init_nimer_backend(
+            nimer_api_key=nimer_api_key,
+            base_url=base_url,
+            retry_policy=retry_policy,
+        )
         self._http: httpx.Client | None = None
         self._http_lock = threading.Lock()
-        self._retry_policy = retry_policy
         self._usage_logger: UsageLogger | None = (
             UsageLogger(api_key=nimer_api_key, base_url=base_url)
             if nimer_api_key
@@ -178,10 +149,11 @@ class OptimizedClaude:
         Returns the full JSON response from /v1/chat. Requires ``nimer_api_key``
         to be configured (raises :class:`ConfigurationError` otherwise).
         """
-        return self._call_nimer_endpoint(
+        return self._post_nimer_sync(
             path="/v1/chat",
             payload={"messages": messages, "mode": mode, **kwargs},
             timeout=_CHAT_TIMEOUT_SECS if mode == "auto" else _ULTRATHINK_TIMEOUT_SECS,
+            http=self._get_http(),
         )
 
     def ultrathink(
@@ -204,10 +176,11 @@ class OptimizedClaude:
             print(response["providers_used"])       # ["anthropic", "openai", ...]
             print(response["individual_responses"]) # raw response per provider
         """
-        return self._call_nimer_endpoint(
+        return self._post_nimer_sync(
             path="/v1/ultrathink",
             payload={"messages": messages, **kwargs},
             timeout=_ULTRATHINK_TIMEOUT_SECS,
+            http=self._get_http(),
         )
 
     # ------------------------------------------------------------------
@@ -256,34 +229,13 @@ class OptimizedClaude:
                     print(f"\\n[{event['model']}] "
                           f"{event['input_tokens']}+{event['output_tokens']} tok")
         """
-        if not self._nimer_api_key:
-            raise ConfigurationError(
-                "nimer_api_key is required for stream() "
-                "(or set NIMER_API_KEY env var)."
-            )
-
-        url = f"{self._nimer_base_url}/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self._nimer_api_key}",
-            "Accept": "text/event-stream",
-            "Content-Type": "application/json",
-        }
-        payload = build_payload(
-            messages=messages, model=model, max_tokens=max_tokens, extra=extra
+        yield from self._iter_stream_sync(
+            self._get_http(),
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            extra=extra,
         )
-        http = self._get_http()
-        with http.stream(
-            "POST", url, json=payload, headers=headers, timeout=_STREAM_TIMEOUT
-        ) as resp:
-            if resp.status_code >= 400:
-                _raise_for_stream_error(resp.status_code, resp.read())
-            for line in resp.iter_lines():
-                parsed = parse_sse_line(line)
-                if parsed is None:
-                    continue
-                if parsed == "DONE":
-                    return
-                yield parsed  # type: ignore[misc]
 
     def stream_text(
         self,
@@ -302,42 +254,11 @@ class OptimizedClaude:
             for token in client.stream_text(messages):
                 print(token, end="", flush=True)
         """
-        for event in self.stream(
-            messages, model=model, max_tokens=max_tokens, **extra
-        ):
-            kind = event.get("type")
-            if kind == "delta":
-                yield event.get("content", "")
-            elif kind == "error":
-                raise NimerError(
-                    event.get("message", "Provider error during stream.")
-                )
-
-    def _call_nimer_endpoint(
-        self,
-        *,
-        path: str,
-        payload: dict[str, Any],
-        timeout: float,
-    ) -> dict[str, Any]:
-        if not self._nimer_api_key:
-            raise ConfigurationError(
-                "nimer_api_key is required for chat() / ultrathink() "
-                "(or set NIMER_API_KEY env var)."
+        yield from self._iter_stream_text_sync(
+            self.stream(
+                messages, model=model, max_tokens=max_tokens, **extra
             )
-        url = f"{self._nimer_base_url}{path}"
-        headers = {
-            "Authorization": f"Bearer {self._nimer_api_key}",
-            "Content-Type": "application/json",
-            **otel_trace_headers(),
-        }
-        http = self._get_http()
-
-        def _do() -> httpx.Response:
-            return http.post(url, json=payload, headers=headers, timeout=timeout)
-
-        response = request_with_policy(self._retry_policy, "nimer", _do)
-        return response.json()
+        )
 
     # ------------------------------------------------------------------
     # Internal — used by the messages proxy
@@ -371,7 +292,7 @@ class OptimizedClaude:
         request_id: str | None = None,
         success: bool = True,
     ) -> dict[str, Any]:
-        return self._call_nimer_endpoint(
+        return self._post_nimer_sync(
             path="/v1/feedback/routing",
             payload={
                 "task_type": task_type,
@@ -381,6 +302,7 @@ class OptimizedClaude:
                 "success": success,
             },
             timeout=10.0,
+            http=self._get_http(),
         )
 
     def _call_with_latency(self, forward_kwargs: dict[str, Any]) -> tuple[Any, float]:
@@ -452,7 +374,7 @@ class _MessagesProxy:
         return self._client._anthropic.messages.stream(**forward_kwargs)
 
 
-class AsyncNimer:
+class AsyncNimer(_NimerBackendCore):
     """Async drop-in for OptimizedClaude — full routing, Trust Gateway, and logging."""
 
     def __init__(
@@ -474,11 +396,13 @@ class AsyncNimer:
         self._anthropic = AsyncAnthropic(api_key=anthropic_api_key)
         self._router = router or Router()
         self._trust_gateway = trust_gateway or AIQualityTrustGateway()
-        self._nimer_api_key: _SecretStr | None = _as_secret(nimer_api_key)
-        self._nimer_base_url = base_url.rstrip("/")
+        self._init_nimer_backend(
+            nimer_api_key=nimer_api_key,
+            base_url=base_url,
+            retry_policy=retry_policy,
+        )
         self._http: httpx.AsyncClient | None = None
         self._http_lock = asyncio.Lock()
-        self._retry_policy = retry_policy
         self._usage_logger: UsageLogger | None = (
             UsageLogger(api_key=nimer_api_key, base_url=base_url) if nimer_api_key else None
         )
@@ -536,10 +460,11 @@ class AsyncNimer:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Async version of :meth:`OptimizedClaude.chat`. See its docstring."""
-        return await self._acall_nimer_endpoint(
+        return await self._post_nimer_async(
             path="/v1/chat",
             payload={"messages": messages, "mode": mode, **kwargs},
             timeout=_CHAT_TIMEOUT_SECS if mode == "auto" else _ULTRATHINK_TIMEOUT_SECS,
+            http=await self._get_http(),
         )
 
     async def aultrathink(
@@ -548,10 +473,11 @@ class AsyncNimer:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Async version of :meth:`OptimizedClaude.ultrathink`. See its docstring."""
-        return await self._acall_nimer_endpoint(
+        return await self._post_nimer_async(
             path="/v1/ultrathink",
             payload={"messages": messages, **kwargs},
             timeout=_ULTRATHINK_TIMEOUT_SECS,
+            http=await self._get_http(),
         )
 
     # ------------------------------------------------------------------
@@ -575,35 +501,14 @@ class AsyncNimer:
                 if event["type"] == "delta":
                     print(event["content"], end="", flush=True)
         """
-        if not self._nimer_api_key:
-            raise ConfigurationError(
-                "nimer_api_key is required for astream() "
-                "(or set NIMER_API_KEY env var)."
-            )
-
-        url = f"{self._nimer_base_url}/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self._nimer_api_key}",
-            "Accept": "text/event-stream",
-            "Content-Type": "application/json",
-        }
-        payload = build_payload(
-            messages=messages, model=model, max_tokens=max_tokens, extra=extra
-        )
-        http = await self._get_http()
-        async with http.stream(
-            "POST", url, json=payload, headers=headers, timeout=_STREAM_TIMEOUT
-        ) as resp:
-            if resp.status_code >= 400:
-                body = await resp.aread()
-                _raise_for_stream_error(resp.status_code, body)
-            async for line in resp.aiter_lines():
-                parsed = parse_sse_line(line)
-                if parsed is None:
-                    continue
-                if parsed == "DONE":
-                    return
-                yield parsed  # type: ignore[misc]
+        async for event in self._iter_stream_async(
+            await self._get_http(),
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            extra=extra,
+        ):
+            yield event
 
     async def astream_text(
         self,
@@ -621,35 +526,11 @@ class AsyncNimer:
             if kind == "delta":
                 yield event.get("content", "")
             elif kind == "error":
+                from .exceptions import NimerError
+
                 raise NimerError(
                     event.get("message", "Provider error during stream.")
                 )
-
-    async def _acall_nimer_endpoint(
-        self,
-        *,
-        path: str,
-        payload: dict[str, Any],
-        timeout: float,
-    ) -> dict[str, Any]:
-        if not self._nimer_api_key:
-            raise ConfigurationError(
-                "nimer_api_key is required for achat() / aultrathink() "
-                "(or set NIMER_API_KEY env var)."
-            )
-        url = f"{self._nimer_base_url}{path}"
-        headers = {
-            "Authorization": f"Bearer {self._nimer_api_key}",
-            "Content-Type": "application/json",
-            **otel_trace_headers(),
-        }
-        http = await self._get_http()
-
-        async def _do() -> httpx.Response:
-            return await http.post(url, json=payload, headers=headers, timeout=timeout)
-
-        response = await arequest_with_policy(self._retry_policy, "nimer", _do)
-        return response.json()
 
     @staticmethod
     def _next_fallback_model(current_model: str) -> str | None:
@@ -667,7 +548,7 @@ class AsyncNimer:
         request_id: str | None = None,
         success: bool = True,
     ) -> dict[str, Any]:
-        return await self._acall_nimer_endpoint(
+        return await self._post_nimer_async(
             path="/v1/feedback/routing",
             payload={
                 "task_type": task_type,
@@ -677,6 +558,7 @@ class AsyncNimer:
                 "success": success,
             },
             timeout=10.0,
+            http=await self._get_http(),
         )
 
     async def _create_message(

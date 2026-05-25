@@ -38,6 +38,7 @@ from .exceptions import (
     TrustGatewayError,
 )
 from .retry_policy import RetryPolicy
+from ._http_helpers import configure_otel_tracing
 from .pricing import estimate_cost, estimate_savings
 from .router import Router
 
@@ -65,6 +66,7 @@ __all__ = [
     "ComplianceError",
     "RateLimitError",
     "RetryPolicy",
+    "configure_otel_tracing",
     "AIQualityTrustGateway",
     "GatewayIssue",
     "GatewayPolicy",

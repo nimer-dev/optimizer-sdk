@@ -15,6 +15,42 @@ from .retry_policy import (
 )
 
 
+def configure_otel_tracing(
+    *,
+    endpoint: str | None = None,
+    service_name: str = "nimer-sdk",
+) -> bool:
+    """Optional OTLP HTTP exporter for enterprise telemetry (VISION-6).
+
+    Returns True when tracing was configured. Safe to call multiple times.
+    """
+    try:
+        from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    except ImportError:
+        return False
+
+    url = (endpoint or "").strip() or (
+        __import__("os").environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or ""
+    ).strip()
+    if not url:
+        return False
+    if not url.endswith("/v1/traces"):
+        url = url.rstrip("/") + "/v1/traces"
+
+    provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
+    provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=url))
+    )
+    trace.set_tracer_provider(provider)
+    return True
+
+
 def otel_trace_headers() -> dict[str, str]:
     try:
         from opentelemetry import trace

@@ -2,25 +2,215 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, AsyncIterator, Callable, Iterator
 
-from .exceptions import TrustGatewayError
+import httpx
+
+from ._streaming import build_payload, parse_sse_line
+from .exceptions import ConfigurationError, NimerError, TrustGatewayError, raise_for_http_status
 from .logger import UsageLogger
 from .pricing import estimate_savings
+from .retry_policy import RetryPolicy
+from ._http_helpers import arequest_with_policy, otel_trace_headers, request_with_policy
+
+_CHAT_TIMEOUT_SECS = 30.0
+_ULTRATHINK_TIMEOUT_SECS = 60.0
+_STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
 
 
 class _SecretStr(str):
-    """API key holder that does not leak in repr/str."""
+    """API key holder that does not leak in repr (str value unchanged for auth)."""
 
     def __repr__(self) -> str:
         return "'[REDACTED]'"
 
-    def __str__(self) -> str:
-        return "[REDACTED]"
-
 
 def _as_secret(value: str | None) -> _SecretStr | None:
     return _SecretStr(value) if value else None
+
+
+def _bearer_token(api_key: _SecretStr | None) -> str:
+    if not api_key:
+        raise ConfigurationError(
+            "nimer_api_key is required (or set NIMER_API_KEY env var)."
+        )
+    return api_key
+
+
+def _raise_for_stream_error(status: int, body: bytes) -> None:
+    try:
+        parsed = httpx.Response(status_code=status, content=body).json()
+    except Exception:
+        parsed = body.decode("utf-8", errors="replace")
+    if isinstance(parsed, dict) and "detail" in parsed:
+        detail = parsed["detail"]
+        if isinstance(detail, dict):
+            msg = detail.get("message") or str(detail)
+        else:
+            msg = str(detail)
+    else:
+        msg = str(parsed)
+    raise_for_http_status(
+        status,
+        f"Nimer streaming request failed (HTTP {status}): {msg}",
+        detail=parsed,
+    )
+
+
+class _NimerBackendCore:
+    """Shared Nimer HTTP API surface (ARCH-9 DRY base)."""
+
+    _nimer_api_key: _SecretStr | None
+    _nimer_base_url: str
+    _retry_policy: RetryPolicy | None
+
+    def _init_nimer_backend(
+        self,
+        *,
+        nimer_api_key: str | None,
+        base_url: str,
+        retry_policy: RetryPolicy | None,
+    ) -> None:
+        self._nimer_api_key = _as_secret(nimer_api_key)
+        self._nimer_base_url = base_url.rstrip("/")
+        self._retry_policy = retry_policy
+
+    def _nimer_json_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {_bearer_token(self._nimer_api_key)}",
+            "Content-Type": "application/json",
+            **otel_trace_headers(),
+        }
+
+    def _nimer_stream_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {_bearer_token(self._nimer_api_key)}",
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+        }
+
+    def _post_nimer_sync(
+        self,
+        *,
+        path: str,
+        payload: dict[str, Any],
+        timeout: float,
+        http: httpx.Client,
+    ) -> dict[str, Any]:
+        url = f"{self._nimer_base_url}{path}"
+
+        def _do() -> httpx.Response:
+            return http.post(
+                url, json=payload, headers=self._nimer_json_headers(), timeout=timeout
+            )
+
+        response = request_with_policy(self._retry_policy, "nimer", _do)
+        return response.json()
+
+    async def _post_nimer_async(
+        self,
+        *,
+        path: str,
+        payload: dict[str, Any],
+        timeout: float,
+        http: httpx.AsyncClient,
+    ) -> dict[str, Any]:
+        url = f"{self._nimer_base_url}{path}"
+
+        async def _do() -> httpx.Response:
+            return await http.post(
+                url, json=payload, headers=self._nimer_json_headers(), timeout=timeout
+            )
+
+        response = await arequest_with_policy(self._retry_policy, "nimer", _do)
+        return response.json()
+
+    def _iter_stream_sync(
+        self,
+        http: httpx.Client,
+        *,
+        messages: list[dict[str, Any]],
+        model: str | None,
+        max_tokens: int,
+        extra: dict[str, Any],
+    ) -> Iterator[dict[str, Any]]:
+        url = f"{self._nimer_base_url}/v1/chat/completions"
+        payload = build_payload(
+            messages=messages, model=model, max_tokens=max_tokens, extra=extra
+        )
+        with http.stream(
+            "POST",
+            url,
+            json=payload,
+            headers=self._nimer_stream_headers(),
+            timeout=_STREAM_TIMEOUT,
+        ) as resp:
+            if resp.status_code >= 400:
+                _raise_for_stream_error(resp.status_code, resp.read())
+            for line in resp.iter_lines():
+                parsed = parse_sse_line(line)
+                if parsed is None:
+                    continue
+                if parsed == "DONE":
+                    return
+                yield parsed  # type: ignore[misc]
+
+    async def _iter_stream_async(
+        self,
+        http: httpx.AsyncClient,
+        *,
+        messages: list[dict[str, Any]],
+        model: str | None,
+        max_tokens: int,
+        extra: dict[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        url = f"{self._nimer_base_url}/v1/chat/completions"
+        payload = build_payload(
+            messages=messages, model=model, max_tokens=max_tokens, extra=extra
+        )
+        async with http.stream(
+            "POST",
+            url,
+            json=payload,
+            headers=self._nimer_stream_headers(),
+            timeout=_STREAM_TIMEOUT,
+        ) as resp:
+            if resp.status_code >= 400:
+                body = await resp.aread()
+                _raise_for_stream_error(resp.status_code, body)
+            async for line in resp.aiter_lines():
+                parsed = parse_sse_line(line)
+                if parsed is None:
+                    continue
+                if parsed == "DONE":
+                    return
+                yield parsed  # type: ignore[misc]
+
+    def _iter_stream_text_sync(
+        self,
+        events: Iterator[dict[str, Any]],
+    ) -> Iterator[str]:
+        for event in events:
+            kind = event.get("type")
+            if kind == "delta":
+                yield event.get("content", "")
+            elif kind == "error":
+                raise NimerError(
+                    event.get("message", "Provider error during stream.")
+                )
+
+    async def _iter_stream_text_async(
+        self,
+        events: AsyncIterator[dict[str, Any]],
+    ) -> AsyncIterator[str]:
+        async for event in events:
+            kind = event.get("type")
+            if kind == "delta":
+                yield event.get("content", "")
+            elif kind == "error":
+                raise NimerError(
+                    event.get("message", "Provider error during stream.")
+                )
 
 
 def _build_forward_kwargs(
