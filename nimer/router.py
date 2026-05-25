@@ -17,18 +17,36 @@ from typing import Any, Iterable
 
 from ._constants import MODEL_HAIKU, MODEL_OPUS, MODEL_SONNET
 
+_TIKTOKEN_ENC = None
+
+
+def _get_tiktoken_enc():
+    global _TIKTOKEN_ENC
+    if _TIKTOKEN_ENC is None:
+        try:
+            import tiktoken
+
+            _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            pass
+    return _TIKTOKEN_ENC
+
 
 class Router:
     """Pick the cheapest Claude model that can handle a given request."""
 
-    # Token thresholds (tiktoken when installed; script-aware heuristic otherwise).
-    SHORT_INPUT_TOKENS = 50
-    LONG_INPUT_TOKENS = 1250
-    LONG_CODE_TOKENS = 125
-
-    # Keywords that suggest code is in the request. Cheap heuristic; we'll
-    # replace this with something smarter once we have usage data.
     CODE_MARKERS = ("```", "def ", "class ", "function ", "import ", "const ", "=> {")
+
+    def __init__(
+        self,
+        *,
+        short_input_tokens: int = 50,
+        long_input_tokens: int = 1250,
+        long_code_tokens: int = 125,
+    ) -> None:
+        self._short_input_tokens = short_input_tokens
+        self._long_input_tokens = long_input_tokens
+        self._long_code_tokens = long_code_tokens
 
     def choose(
         self,
@@ -41,13 +59,13 @@ class Router:
         last_user_tokens = self._estimate_tokens(last_user)
         has_code = self._looks_like_code(last_user)
 
-        if total_tokens > self.LONG_INPUT_TOKENS:
+        if total_tokens > self._long_input_tokens:
             return MODEL_SONNET
 
-        if has_code and last_user_tokens > self.LONG_CODE_TOKENS:
+        if has_code and last_user_tokens > self._long_code_tokens:
             return MODEL_SONNET
 
-        if last_user_tokens < self.SHORT_INPUT_TOKENS:
+        if last_user_tokens < self._short_input_tokens:
             return MODEL_HAIKU
 
         # Everything in between: Sonnet is the safe middle ground.
@@ -85,13 +103,9 @@ class Router:
     def _estimate_tokens(text: str) -> int:
         if not text:
             return 0
-        try:
-            import tiktoken
-
-            enc = tiktoken.get_encoding("cl100k_base")
+        enc = _get_tiktoken_enc()
+        if enc is not None:
             return len(enc.encode(text))
-        except Exception:
-            pass
         # Arabic/CJK: ~1 char ≈ 1 token; Latin-heavy English: ~4 chars/token.
         non_ascii = sum(1 for c in text if ord(c) > 127)
         if non_ascii > len(text) * 0.12:

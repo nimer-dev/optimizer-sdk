@@ -12,7 +12,9 @@ request, then forwards everything else to the real Anthropic SDK.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
 import time
 from typing import Any, AsyncIterator, Iterator
 
@@ -24,9 +26,14 @@ from ._streaming import build_payload, parse_sse_line
 from .ai_quality_gateway import AIQualityTrustGateway
 from .exceptions import ConfigurationError, NimerError, TrustGatewayError
 from .logger import UsageLogger
-from .pricing import estimate_savings
 from .router import Router
 from .routing_engine import fallback_chain, next_fallback_model
+from ._client_common import (
+    _SecretStr,
+    _as_secret,
+    _run_messages_create_async,
+    _run_messages_create_sync,
+)
 
 
 # Default timeout for Ultrathink fan-out + synthesis (slower than a single call).
@@ -84,12 +91,10 @@ class OptimizedClaude:
         self._anthropic = Anthropic(api_key=anthropic_api_key)
         self._router = router or Router()
         self._trust_gateway = trust_gateway or AIQualityTrustGateway()
-        self._nimer_api_key = nimer_api_key
+        self._nimer_api_key: _SecretStr | None = _as_secret(nimer_api_key)
         self._nimer_base_url = base_url.rstrip("/")
-        # Persistent HTTP client for /v1/chat and /v1/ultrathink so we
-        # reuse the TLS connection across calls instead of paying for a
-        # fresh handshake every request.
         self._http: httpx.Client | None = None
+        self._http_lock = threading.Lock()
         self._usage_logger: UsageLogger | None = (
             UsageLogger(api_key=nimer_api_key, base_url=base_url)
             if nimer_api_key
@@ -98,6 +103,9 @@ class OptimizedClaude:
 
         # Mirror anthropic.Anthropic's `.messages.create(...)` shape.
         self.messages = _MessagesProxy(self)
+
+    def __repr__(self) -> str:
+        return f"OptimizedClaude(base_url={self._nimer_base_url!r})"
 
     # Context-manager support so callers can do `with OptimizedClaude(...)`
     # and get deterministic socket cleanup on exit.
@@ -116,17 +124,29 @@ class OptimizedClaude:
                 pass
             self._http = None
 
-    def _get_http(self, timeout: float) -> httpx.Client:
+    def _get_http(self) -> httpx.Client:
         """Lazily create and reuse a single httpx.Client per instance."""
-        if self._http is None or self._http.is_closed:
-            self._http = httpx.Client(
-                timeout=timeout,
-                limits=httpx.Limits(
-                    max_connections=20,
-                    max_keepalive_connections=10,
-                ),
+        with self._http_lock:
+            if self._http is None or self._http.is_closed:
+                self._http = httpx.Client(
+                    limits=httpx.Limits(
+                        max_connections=20,
+                        max_keepalive_connections=10,
+                    ),
+                )
+            return self._http
+
+    def ping(self) -> bool:
+        """Warm TCP/TLS and verify API reachability."""
+        try:
+            http = self._get_http()
+            response = http.get(
+                f"{self._nimer_base_url}/health",
+                timeout=5.0,
             )
-        return self._http
+            return response.status_code == 200
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Multi-provider routing — calls the Nimer backend, NOT Anthropic
@@ -247,7 +267,7 @@ class OptimizedClaude:
         payload = build_payload(
             messages=messages, model=model, max_tokens=max_tokens, extra=extra
         )
-        http = self._get_http(_CHAT_TIMEOUT_SECS)
+        http = self._get_http()
         with http.stream(
             "POST", url, json=payload, headers=headers, timeout=_STREAM_TIMEOUT
         ) as resp:
@@ -306,7 +326,7 @@ class OptimizedClaude:
             "Authorization": f"Bearer {self._nimer_api_key}",
             "Content-Type": "application/json",
         }
-        http = self._get_http(timeout)
+        http = self._get_http()
         response = http.post(url, json=payload, headers=headers, timeout=timeout)
         response.raise_for_status()
         return response.json()
@@ -324,113 +344,15 @@ class OptimizedClaude:
         system: str | list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
-        filtered_messages, input_issues, input_blocked = self._trust_gateway.filter_input(
-            messages,
+        return _run_messages_create_sync(
+            self,
+            messages=messages,
+            auto_route=auto_route,
+            model=model,
             system=system,
+            baseline_model=BASELINE_MODEL,
+            kwargs=kwargs,
         )
-        if input_blocked:
-            raise TrustGatewayError("AI Quality & Trust Gateway blocked unsafe input prompt.")
-
-        # Decide which model to actually call.
-        # When auto_route=True the router always wins — the user's `model`
-        # becomes the logged "requested_model" only. This is the core product
-        # promise: same call, smarter (cheaper) model automatically.
-        # Pass auto_route=False to pin a specific model.
-        if auto_route:
-            chosen_model = self._router.choose(messages, system=system)
-        else:
-            chosen_model = model or BASELINE_MODEL
-
-        # Build the kwargs we forward to the real Anthropic SDK.
-        forward_kwargs: dict[str, Any] = {
-            "model": chosen_model,
-            "messages": filtered_messages,
-            **kwargs,
-        }
-        if system is not None:
-            forward_kwargs["system"] = system
-
-        report = None
-        response = None
-        latency_ms = 0.0
-        input_tokens = 0
-        output_tokens = 0
-        blocked_by_gateway = False
-        fallback_attempts = 0
-        for candidate_model in self._fallback_chain(chosen_model):
-            if candidate_model != chosen_model:
-                fallback_attempts += 1
-            forward_kwargs["model"] = candidate_model
-            response, latency_ms = self._call_with_latency(forward_kwargs)
-            usage = getattr(response, "usage", None)
-            input_tokens = getattr(usage, "input_tokens", 0) or 0
-            output_tokens = getattr(usage, "output_tokens", 0) or 0
-            try:
-                report = self._trust_gateway.enforce(
-                    response,
-                    latency_ms=latency_ms,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                )
-                if input_issues:
-                    merged_issues = tuple(input_issues) + tuple(report.issues)
-                    merged_score = self._trust_gateway._score_issues(list(merged_issues))
-                    report = report.__class__(
-                        is_valid=report.is_valid,
-                        is_safe=report.is_safe,
-                        is_biased=report.is_biased,
-                        has_pii=report.has_pii or any(i.category == "pii" for i in input_issues),
-                        is_toxic=report.is_toxic or any(i.category == "toxicity" for i in input_issues),
-                        safety_score=min(report.safety_score, merged_score),
-                        redacted_text=report.redacted_text,
-                        input_tokens=report.input_tokens,
-                        output_tokens=report.output_tokens,
-                        total_tokens=report.total_tokens,
-                        latency_ms=report.latency_ms,
-                        issues=merged_issues,
-                    )
-                chosen_model = candidate_model
-                break
-            except TrustGatewayError:
-                raise
-
-        if report is None or response is None:
-            raise TrustGatewayError("AI Quality & Trust Gateway blocked the response.")
-        # Expose report for downstream observability without changing return shape.
-        try:
-            setattr(response, "_nimer_trust_report", report.to_dict())
-        except Exception:  # pragma: no cover - some SDK response objects may be immutable
-            pass
-
-        # Best-effort metadata logging. Never let logging issues bubble
-        # up — they'd undermine the "drop-in replacement" promise.
-        if self._usage_logger is not None:
-            try:
-                report_dict = report.to_dict()
-                savings = estimate_savings(
-                    actual_model=chosen_model,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                )
-                self._usage_logger.log_async(
-                    requested_model=model,
-                    actual_model=chosen_model,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    estimated_savings_usd=savings,
-                    auto_routed=(auto_route and model is None),
-                )
-                self._usage_logger.log_trust_async(
-                    requested_model=model,
-                    actual_model=chosen_model,
-                    report=report_dict,
-                    blocked_by_gateway=blocked_by_gateway,
-                    fallback_attempts=fallback_attempts,
-                )
-            except Exception:  # pragma: no cover - defensive
-                pass
-
-        return response
 
     def _call_with_latency(self, forward_kwargs: dict[str, Any]) -> tuple[Any, float]:
         started = time.perf_counter()
@@ -522,15 +444,17 @@ class AsyncNimer:
         self._anthropic = AsyncAnthropic(api_key=anthropic_api_key)
         self._router = router or Router()
         self._trust_gateway = trust_gateway or AIQualityTrustGateway()
-        self._nimer_api_key = nimer_api_key
+        self._nimer_api_key: _SecretStr | None = _as_secret(nimer_api_key)
         self._nimer_base_url = base_url.rstrip("/")
-        # Reused across achat/aultrathink so we don't pay for a TLS
-        # handshake on every call.
         self._http: httpx.AsyncClient | None = None
+        self._http_lock = asyncio.Lock()
         self._usage_logger: UsageLogger | None = (
             UsageLogger(api_key=nimer_api_key, base_url=base_url) if nimer_api_key else None
         )
         self.messages = _AsyncMessagesProxy(self)
+
+    def __repr__(self) -> str:
+        return f"AsyncNimer(base_url={self._nimer_base_url!r})"
 
     async def __aenter__(self) -> "AsyncNimer":
         return self
@@ -547,16 +471,28 @@ class AsyncNimer:
                 pass
             self._http = None
 
-    def _get_http(self, timeout: float) -> httpx.AsyncClient:
-        if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(
-                timeout=timeout,
-                limits=httpx.Limits(
-                    max_connections=20,
-                    max_keepalive_connections=10,
-                ),
+    async def _get_http(self) -> httpx.AsyncClient:
+        async with self._http_lock:
+            if self._http is None or self._http.is_closed:
+                self._http = httpx.AsyncClient(
+                    limits=httpx.Limits(
+                        max_connections=20,
+                        max_keepalive_connections=10,
+                    ),
+                )
+            return self._http
+
+    async def ping(self) -> bool:
+        """Warm TCP/TLS and verify API reachability."""
+        try:
+            http = await self._get_http()
+            response = await http.get(
+                f"{self._nimer_base_url}/health",
+                timeout=5.0,
             )
-        return self._http
+            return response.status_code == 200
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Async multi-provider routing — calls the Nimer backend, NOT Anthropic
@@ -623,7 +559,7 @@ class AsyncNimer:
         payload = build_payload(
             messages=messages, model=model, max_tokens=max_tokens, extra=extra
         )
-        http = self._get_http(_CHAT_TIMEOUT_SECS)
+        http = await self._get_http()
         async with http.stream(
             "POST", url, json=payload, headers=headers, timeout=_STREAM_TIMEOUT
         ) as resp:
@@ -675,7 +611,7 @@ class AsyncNimer:
             "Authorization": f"Bearer {self._nimer_api_key}",
             "Content-Type": "application/json",
         }
-        http = self._get_http(timeout)
+        http = await self._get_http()
         response = await http.post(url, json=payload, headers=headers, timeout=timeout)
         response.raise_for_status()
         return response.json()
@@ -696,108 +632,15 @@ class AsyncNimer:
         system: str | list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
-        filtered_messages, input_issues, input_blocked = self._trust_gateway.filter_input(
-            messages,
+        return await _run_messages_create_async(
+            self,
+            messages=messages,
+            auto_route=auto_route,
+            model=model,
             system=system,
+            baseline_model=BASELINE_MODEL,
+            kwargs=kwargs,
         )
-        if input_blocked:
-            raise TrustGatewayError("AI Quality & Trust Gateway blocked unsafe input prompt.")
-
-        if auto_route:
-            chosen_model = self._router.choose(messages, system=system)
-        else:
-            chosen_model = model or BASELINE_MODEL
-
-        forward_kwargs: dict[str, Any] = {
-            "model": chosen_model,
-            "messages": filtered_messages,
-            **kwargs,
-        }
-        if system is not None:
-            forward_kwargs["system"] = system
-
-        report = None
-        response = None
-        input_tokens = 0
-        output_tokens = 0
-        latency_ms = 0.0
-        blocked_by_gateway = False
-        fallback_attempts = 0
-
-        for candidate_model in self._fallback_chain(chosen_model):
-            if candidate_model != chosen_model:
-                fallback_attempts += 1
-            forward_kwargs["model"] = candidate_model
-            started = time.perf_counter()
-            response = await self._anthropic.messages.create(**forward_kwargs)
-            latency_ms = (time.perf_counter() - started) * 1000.0
-            usage = getattr(response, "usage", None)
-            input_tokens = getattr(usage, "input_tokens", 0) or 0
-            output_tokens = getattr(usage, "output_tokens", 0) or 0
-            try:
-                report = self._trust_gateway.enforce(
-                    response,
-                    latency_ms=latency_ms,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                )
-                if input_issues:
-                    merged_issues = tuple(input_issues) + tuple(report.issues)
-                    merged_score = self._trust_gateway._score_issues(list(merged_issues))
-                    report = report.__class__(
-                        is_valid=report.is_valid,
-                        is_safe=report.is_safe,
-                        is_biased=report.is_biased,
-                        has_pii=report.has_pii or any(i.category == "pii" for i in input_issues),
-                        is_toxic=report.is_toxic or any(i.category == "toxicity" for i in input_issues),
-                        safety_score=min(report.safety_score, merged_score),
-                        redacted_text=report.redacted_text,
-                        input_tokens=report.input_tokens,
-                        output_tokens=report.output_tokens,
-                        total_tokens=report.total_tokens,
-                        latency_ms=report.latency_ms,
-                        issues=merged_issues,
-                    )
-                chosen_model = candidate_model
-                break
-            except TrustGatewayError:
-                raise
-
-        if report is None or response is None:
-            raise TrustGatewayError("AI Quality & Trust Gateway blocked the response.")
-
-        try:
-            setattr(response, "_nimer_trust_report", report.to_dict())
-        except Exception:  # pragma: no cover
-            pass
-
-        if self._usage_logger is not None:
-            try:
-                report_dict = report.to_dict()
-                savings = estimate_savings(
-                    actual_model=chosen_model,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                )
-                self._usage_logger.log_async(
-                    requested_model=model,
-                    actual_model=chosen_model,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    estimated_savings_usd=savings,
-                    auto_routed=(auto_route and model is None),
-                )
-                self._usage_logger.log_trust_async(
-                    requested_model=model,
-                    actual_model=chosen_model,
-                    report=report_dict,
-                    blocked_by_gateway=blocked_by_gateway,
-                    fallback_attempts=fallback_attempts,
-                )
-            except Exception:  # pragma: no cover - defensive
-                pass
-
-        return response
 
 
 class _AsyncMessagesProxy:
