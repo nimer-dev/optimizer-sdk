@@ -24,7 +24,9 @@ from anthropic import Anthropic, AsyncAnthropic
 from ._constants import BASELINE_MODEL, MODEL_HAIKU, MODEL_OPUS, MODEL_SONNET
 from ._streaming import build_payload, parse_sse_line
 from .ai_quality_gateway import AIQualityTrustGateway
-from .exceptions import ConfigurationError, NimerError, TrustGatewayError
+from .exceptions import ConfigurationError, NimerError, TrustGatewayError, raise_for_http_status
+from ._http_helpers import arequest_with_policy, otel_trace_headers, request_with_policy
+from .retry_policy import RetryPolicy
 from .logger import UsageLogger
 from .router import Router
 from .routing_engine import fallback_chain, next_fallback_model
@@ -63,7 +65,7 @@ def _raise_for_stream_error(status: int, body: bytes) -> None:
             msg = str(detail)
     else:
         msg = str(parsed)
-    raise NimerError(f"Nimer streaming request failed (HTTP {status}): {msg}")
+    raise_for_http_status(status, f"Nimer streaming request failed (HTTP {status}): {msg}", detail=parsed)
 
 
 class OptimizedClaude:
@@ -77,6 +79,7 @@ class OptimizedClaude:
         base_url: str = "https://api.nimer.dev",
         router: Router | None = None,
         trust_gateway: AIQualityTrustGateway | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         # Fall back to env vars so users can keep the same setup as the
         # vanilla anthropic SDK (ANTHROPIC_API_KEY).
@@ -95,6 +98,7 @@ class OptimizedClaude:
         self._nimer_base_url = base_url.rstrip("/")
         self._http: httpx.Client | None = None
         self._http_lock = threading.Lock()
+        self._retry_policy = retry_policy
         self._usage_logger: UsageLogger | None = (
             UsageLogger(api_key=nimer_api_key, base_url=base_url)
             if nimer_api_key
@@ -325,10 +329,14 @@ class OptimizedClaude:
         headers = {
             "Authorization": f"Bearer {self._nimer_api_key}",
             "Content-Type": "application/json",
+            **otel_trace_headers(),
         }
         http = self._get_http()
-        response = http.post(url, json=payload, headers=headers, timeout=timeout)
-        response.raise_for_status()
+
+        def _do() -> httpx.Response:
+            return http.post(url, json=payload, headers=headers, timeout=timeout)
+
+        response = request_with_policy(self._retry_policy, "nimer", _do)
         return response.json()
 
     # ------------------------------------------------------------------
@@ -352,6 +360,27 @@ class OptimizedClaude:
             system=system,
             baseline_model=BASELINE_MODEL,
             kwargs=kwargs,
+        )
+
+    def feedback(
+        self,
+        *,
+        task_type: str,
+        model: str,
+        quality_score: float,
+        request_id: str | None = None,
+        success: bool = True,
+    ) -> dict[str, Any]:
+        return self._call_nimer_endpoint(
+            path="/v1/feedback/routing",
+            payload={
+                "task_type": task_type,
+                "model": model,
+                "quality_score": quality_score,
+                "request_id": request_id,
+                "success": success,
+            },
+            timeout=10.0,
         )
 
     def _call_with_latency(self, forward_kwargs: dict[str, Any]) -> tuple[Any, float]:
@@ -434,6 +463,7 @@ class AsyncNimer:
         base_url: str = "https://api.nimer.dev",
         router: Router | None = None,
         trust_gateway: AIQualityTrustGateway | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         anthropic_api_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
         if not anthropic_api_key:
@@ -448,6 +478,7 @@ class AsyncNimer:
         self._nimer_base_url = base_url.rstrip("/")
         self._http: httpx.AsyncClient | None = None
         self._http_lock = asyncio.Lock()
+        self._retry_policy = retry_policy
         self._usage_logger: UsageLogger | None = (
             UsageLogger(api_key=nimer_api_key, base_url=base_url) if nimer_api_key else None
         )
@@ -610,10 +641,14 @@ class AsyncNimer:
         headers = {
             "Authorization": f"Bearer {self._nimer_api_key}",
             "Content-Type": "application/json",
+            **otel_trace_headers(),
         }
         http = await self._get_http()
-        response = await http.post(url, json=payload, headers=headers, timeout=timeout)
-        response.raise_for_status()
+
+        async def _do() -> httpx.Response:
+            return await http.post(url, json=payload, headers=headers, timeout=timeout)
+
+        response = await arequest_with_policy(self._retry_policy, "nimer", _do)
         return response.json()
 
     @staticmethod
@@ -622,6 +657,27 @@ class AsyncNimer:
 
     def _fallback_chain(self, initial_model: str) -> tuple[str, ...]:
         return fallback_chain(initial_model)
+
+    async def feedback(
+        self,
+        *,
+        task_type: str,
+        model: str,
+        quality_score: float,
+        request_id: str | None = None,
+        success: bool = True,
+    ) -> dict[str, Any]:
+        return await self._acall_nimer_endpoint(
+            path="/v1/feedback/routing",
+            payload={
+                "task_type": task_type,
+                "model": model,
+                "quality_score": quality_score,
+                "request_id": request_id,
+                "success": success,
+            },
+            timeout=10.0,
+        )
 
     async def _create_message(
         self,

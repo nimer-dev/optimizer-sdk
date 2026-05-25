@@ -27,7 +27,17 @@ from ._constants import (
 from .ai_quality_gateway import AIQualityTrustGateway, GatewayIssue, GatewayPolicy, GatewayReport
 from ._version import __version__
 from .client import AsyncNimer, OptimizedClaude
-from .exceptions import ConfigurationError, NimerError, RoutingError, TrustGatewayError
+from .exceptions import (
+    BudgetExceededError,
+    ComplianceError,
+    ConfigurationError,
+    NimerError,
+    ProviderError,
+    RateLimitError,
+    RoutingError,
+    TrustGatewayError,
+)
+from .retry_policy import RetryPolicy
 from .pricing import estimate_cost, estimate_savings
 from .router import Router
 
@@ -50,6 +60,11 @@ __all__ = [
     "ConfigurationError",
     "RoutingError",
     "TrustGatewayError",
+    "ProviderError",
+    "BudgetExceededError",
+    "ComplianceError",
+    "RateLimitError",
+    "RetryPolicy",
     "AIQualityTrustGateway",
     "GatewayIssue",
     "GatewayPolicy",
