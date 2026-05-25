@@ -36,6 +36,7 @@ class UsageLogger:
         self._usage_url = f"{root}/v1/usage"
         self._trust_url = f"{root}/v1/trust"
         self._timeout = timeout_seconds
+        self._http = httpx.Client(timeout=timeout_seconds)
         self._queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(maxsize=max_queue_size)
         self._worker = threading.Thread(
             target=self._run_worker,
@@ -68,11 +69,10 @@ class UsageLogger:
 
     def _send(self, payload: dict[str, Any]) -> None:
         try:
-            httpx.post(
+            self._http.post(
                 self._usage_url,
                 json=payload,
                 headers={"Authorization": f"Bearer {self._api_key}"},
-                timeout=self._timeout,
             )
         except Exception as exc:  # pragma: no cover - defensive
             # Logging must never crash the host process. Whisper, don't shout.
@@ -109,11 +109,10 @@ class UsageLogger:
 
     def _send_trust(self, payload: dict[str, Any]) -> None:
         try:
-            httpx.post(
+            self._http.post(
                 self._trust_url,
                 json=payload,
                 headers={"Authorization": f"Bearer {self._api_key}"},
-                timeout=self._timeout,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("Nimer trust log failed: %s", exc)

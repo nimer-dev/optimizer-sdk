@@ -21,12 +21,10 @@ from ._constants import MODEL_HAIKU, MODEL_OPUS, MODEL_SONNET
 class Router:
     """Pick the cheapest Claude model that can handle a given request."""
 
-    # Tunable thresholds. These are chars, not tokens, because counting
-    # tokens precisely requires a tokenizer call we want to avoid.
-    # Rough rule of thumb: 1 token ≈ 4 chars for English.
-    SHORT_INPUT_CHARS = 200       # below this, the task is almost certainly trivial
-    LONG_INPUT_CHARS = 5000       # above this, we want a stronger model
-    LONG_CODE_CHARS = 500         # code requests above this go to Opus
+    # Token thresholds (tiktoken when installed; script-aware heuristic otherwise).
+    SHORT_INPUT_TOKENS = 50
+    LONG_INPUT_TOKENS = 1250
+    LONG_CODE_TOKENS = 125
 
     # Keywords that suggest code is in the request. Cheap heuristic; we'll
     # replace this with something smarter once we have usage data.
@@ -39,19 +37,17 @@ class Router:
     ) -> str:
         """Select the model to use for this request."""
         last_user = self._last_user_text(messages)
-        total_chars = self._total_input_chars(messages, system)
+        total_tokens = self._total_input_tokens(messages, system)
+        last_user_tokens = self._estimate_tokens(last_user)
         has_code = self._looks_like_code(last_user)
 
-        # Long context — needs a model with strong long-context handling.
-        if total_chars > self.LONG_INPUT_CHARS:
+        if total_tokens > self.LONG_INPUT_TOKENS:
             return MODEL_SONNET
 
-        # Substantial code-generation or code-understanding tasks.
-        if has_code and len(last_user) > self.LONG_CODE_CHARS:
-            return MODEL_OPUS
+        if has_code and last_user_tokens > self.LONG_CODE_TOKENS:
+            return MODEL_SONNET
 
-        # Short, simple prompts: classification, lookups, casual Q&A.
-        if len(last_user) < self.SHORT_INPUT_CHARS:
+        if last_user_tokens < self.SHORT_INPUT_TOKENS:
             return MODEL_HAIKU
 
         # Everything in between: Sonnet is the safe middle ground.
@@ -70,21 +66,37 @@ class Router:
             return _content_to_text(msg.get("content"))
         return ""
 
-    @staticmethod
-    def _total_input_chars(
+    @classmethod
+    def _total_input_tokens(
+        cls,
         messages: list[dict[str, Any]],
         system: str | list[dict[str, Any]] | None,
     ) -> int:
-        """Approximate total prompt size in characters."""
-        total = 0
+        parts: list[str] = []
         if isinstance(system, str):
-            total += len(system)
+            parts.append(system)
         elif isinstance(system, list):
-            total += sum(len(_content_to_text(part)) for part in system)
-
+            parts.extend(_content_to_text(part) for part in system)
         for msg in messages:
-            total += len(_content_to_text(msg.get("content")))
-        return total
+            parts.append(_content_to_text(msg.get("content")))
+        return cls._estimate_tokens("".join(parts))
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        if not text:
+            return 0
+        try:
+            import tiktoken
+
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        except Exception:
+            pass
+        # Arabic/CJK: ~1 char ≈ 1 token; Latin-heavy English: ~4 chars/token.
+        non_ascii = sum(1 for c in text if ord(c) > 127)
+        if non_ascii > len(text) * 0.12:
+            return len(text)
+        return max(1, len(text) // 4)
 
     @classmethod
     def _looks_like_code(cls, text: str) -> bool:

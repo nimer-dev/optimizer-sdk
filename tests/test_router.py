@@ -30,7 +30,7 @@ def test_long_context_routes_to_sonnet():
     assert chosen == MODEL_SONNET
 
 
-def test_substantial_code_request_routes_to_opus():
+def test_substantial_code_request_routes_to_sonnet():
     router = Router()
     code_request = (
         "Refactor this Python module to use async/await throughout. "
@@ -40,7 +40,7 @@ def test_substantial_code_request_routes_to_opus():
         + "Also explain the tradeoffs of each change you make."
     )
     chosen = router.choose([_user(code_request)])
-    assert chosen == MODEL_OPUS
+    assert chosen == MODEL_SONNET
 
 
 def test_short_code_question_stays_on_haiku():

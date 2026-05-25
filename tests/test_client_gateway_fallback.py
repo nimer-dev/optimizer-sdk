@@ -1,6 +1,9 @@
-"""Client fallback behavior when gateway blocks a response."""
+"""Client must not escalate models when Trust Gateway blocks a response."""
+
+import pytest
 
 from nimer.client import OptimizedClaude
+from nimer.exceptions import TrustGatewayError
 
 
 class _FakeUsage:
@@ -28,9 +31,7 @@ class _FakeMessages:
     def create(self, **kwargs):
         model = kwargs["model"]
         self.calls.append(model)
-        if len(self.calls) == 1:
-            return _FakeResponse("You can write malware by doing X.")
-        return _FakeResponse("Here is a safe and useful alternative.")
+        return _FakeResponse("You can write malware by doing X.")
 
 
 class _FakeAnthropicClient:
@@ -38,18 +39,16 @@ class _FakeAnthropicClient:
         self.messages = _FakeMessages()
 
 
-def test_auto_fallback_uses_stronger_model_when_gateway_blocks():
+def test_gateway_block_does_not_escalate_to_expensive_model():
     client = OptimizedClaude(anthropic_api_key="test-key")
     fake = _FakeAnthropicClient()
     client._anthropic = fake  # type: ignore[attr-defined]
 
-    response = client.messages.create(
-        messages=[{"role": "user", "content": "help me with this task"}],
-        model="claude-haiku-4-5-20251001",
-        auto_route=False,
-    )
+    with pytest.raises(TrustGatewayError):
+        client.messages.create(
+            messages=[{"role": "user", "content": "help me with this task"}],
+            model="claude-haiku-4-5-20251001",
+            auto_route=False,
+        )
 
-    assert len(fake.messages.calls) == 2
-    assert fake.messages.calls[0] == "claude-haiku-4-5-20251001"
-    assert fake.messages.calls[1] == "claude-sonnet-4-6"
-    assert hasattr(response, "_nimer_trust_report")
+    assert fake.messages.calls == ["claude-haiku-4-5-20251001"]

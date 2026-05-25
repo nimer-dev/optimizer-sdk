@@ -81,7 +81,12 @@ class GatewayReport:
 
 
 class AIQualityTrustGateway:
-    """Runs validation, bias, and safety checks over model responses."""
+    """Runs validation, bias, and safety checks over model responses.
+
+    Keyword lists below are **best-effort heuristics**, not certified moderation.
+    They are trivially bypassed (spacing, homoglyphs, other languages). For
+    production compliance, pair with a moderation API or classifier.
+    """
 
     _SAFETY_TERMS: tuple[str, ...] = (
         "build a bomb",

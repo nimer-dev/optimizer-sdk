@@ -26,6 +26,7 @@ from .exceptions import ConfigurationError, NimerError, TrustGatewayError
 from .logger import UsageLogger
 from .pricing import estimate_savings
 from .router import Router
+from .routing_engine import fallback_chain, next_fallback_model
 
 
 # Default timeout for Ultrathink fan-out + synthesis (slower than a single call).
@@ -246,17 +247,19 @@ class OptimizedClaude:
         payload = build_payload(
             messages=messages, model=model, max_tokens=max_tokens, extra=extra
         )
-        with httpx.Client(timeout=_STREAM_TIMEOUT) as http:
-            with http.stream("POST", url, json=payload, headers=headers) as resp:
-                if resp.status_code >= 400:
-                    _raise_for_stream_error(resp.status_code, resp.read())
-                for line in resp.iter_lines():
-                    parsed = parse_sse_line(line)
-                    if parsed is None:
-                        continue
-                    if parsed == "DONE":
-                        return
-                    yield parsed  # type: ignore[misc]
+        http = self._get_http(_CHAT_TIMEOUT_SECS)
+        with http.stream(
+            "POST", url, json=payload, headers=headers, timeout=_STREAM_TIMEOUT
+        ) as resp:
+            if resp.status_code >= 400:
+                _raise_for_stream_error(resp.status_code, resp.read())
+            for line in resp.iter_lines():
+                parsed = parse_sse_line(line)
+                if parsed is None:
+                    continue
+                if parsed == "DONE":
+                    return
+                yield parsed  # type: ignore[misc]
 
     def stream_text(
         self,
@@ -389,11 +392,10 @@ class OptimizedClaude:
                 chosen_model = candidate_model
                 break
             except TrustGatewayError:
-                blocked_by_gateway = True
-                continue
+                raise
 
         if report is None or response is None:
-            raise TrustGatewayError("AI Quality & Trust Gateway blocked all fallback models.")
+            raise TrustGatewayError("AI Quality & Trust Gateway blocked the response.")
         # Expose report for downstream observability without changing return shape.
         try:
             setattr(response, "_nimer_trust_report", report.to_dict())
@@ -438,21 +440,10 @@ class OptimizedClaude:
 
     @staticmethod
     def _next_fallback_model(current_model: str) -> str | None:
-        ordered = (MODEL_HAIKU, MODEL_SONNET, MODEL_OPUS)
-        if current_model not in ordered:
-            return MODEL_SONNET
-        idx = ordered.index(current_model)
-        if idx >= len(ordered) - 1:
-            return None
-        return ordered[idx + 1]
+        return next_fallback_model(current_model)
 
     def _fallback_chain(self, initial_model: str) -> tuple[str, ...]:
-        chain = [initial_model]
-        nxt = self._next_fallback_model(initial_model)
-        while nxt is not None:
-            chain.append(nxt)
-            nxt = self._next_fallback_model(nxt)
-        return tuple(chain)
+        return fallback_chain(initial_model)
 
 
 class _MessagesProxy:
@@ -487,8 +478,24 @@ class _MessagesProxy:
         system: str | list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
-        chosen_model = self._client._router.choose(messages, system=system) if auto_route else (model or BASELINE_MODEL)
-        forward_kwargs: dict[str, Any] = {"model": chosen_model, "messages": messages, **kwargs}
+        filtered_messages, _, blocked = self._client._trust_gateway.filter_input(
+            messages,
+            system=system,
+        )
+        if blocked:
+            raise TrustGatewayError(
+                "AI Quality & Trust Gateway blocked unsafe input prompt."
+            )
+        chosen_model = (
+            self._client._router.choose(filtered_messages, system=system)
+            if auto_route
+            else (model or BASELINE_MODEL)
+        )
+        forward_kwargs: dict[str, Any] = {
+            "model": chosen_model,
+            "messages": filtered_messages,
+            **kwargs,
+        }
         if system is not None:
             forward_kwargs["system"] = system
         return self._client._anthropic.messages.stream(**forward_kwargs)
@@ -616,20 +623,20 @@ class AsyncNimer:
         payload = build_payload(
             messages=messages, model=model, max_tokens=max_tokens, extra=extra
         )
-        async with httpx.AsyncClient(timeout=_STREAM_TIMEOUT) as http:
-            async with http.stream(
-                "POST", url, json=payload, headers=headers
-            ) as resp:
-                if resp.status_code >= 400:
-                    body = await resp.aread()
-                    _raise_for_stream_error(resp.status_code, body)
-                async for line in resp.aiter_lines():
-                    parsed = parse_sse_line(line)
-                    if parsed is None:
-                        continue
-                    if parsed == "DONE":
-                        return
-                    yield parsed  # type: ignore[misc]
+        http = self._get_http(_CHAT_TIMEOUT_SECS)
+        async with http.stream(
+            "POST", url, json=payload, headers=headers, timeout=_STREAM_TIMEOUT
+        ) as resp:
+            if resp.status_code >= 400:
+                body = await resp.aread()
+                _raise_for_stream_error(resp.status_code, body)
+            async for line in resp.aiter_lines():
+                parsed = parse_sse_line(line)
+                if parsed is None:
+                    continue
+                if parsed == "DONE":
+                    return
+                yield parsed  # type: ignore[misc]
 
     async def astream_text(
         self,
@@ -675,21 +682,10 @@ class AsyncNimer:
 
     @staticmethod
     def _next_fallback_model(current_model: str) -> str | None:
-        ordered = (MODEL_HAIKU, MODEL_SONNET, MODEL_OPUS)
-        if current_model not in ordered:
-            return MODEL_SONNET
-        idx = ordered.index(current_model)
-        if idx >= len(ordered) - 1:
-            return None
-        return ordered[idx + 1]
+        return next_fallback_model(current_model)
 
     def _fallback_chain(self, initial_model: str) -> tuple[str, ...]:
-        chain = [initial_model]
-        nxt = self._next_fallback_model(initial_model)
-        while nxt is not None:
-            chain.append(nxt)
-            nxt = self._next_fallback_model(nxt)
-        return tuple(chain)
+        return fallback_chain(initial_model)
 
     async def _create_message(
         self,
@@ -765,11 +761,10 @@ class AsyncNimer:
                 chosen_model = candidate_model
                 break
             except TrustGatewayError:
-                blocked_by_gateway = True
-                continue
+                raise
 
         if report is None or response is None:
-            raise TrustGatewayError("AI Quality & Trust Gateway blocked all fallback models.")
+            raise TrustGatewayError("AI Quality & Trust Gateway blocked the response.")
 
         try:
             setattr(response, "_nimer_trust_report", report.to_dict())
@@ -835,8 +830,24 @@ class _AsyncMessagesProxy:
         system: str | list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> Any:
-        chosen_model = self._client._router.choose(messages, system=system) if auto_route else (model or BASELINE_MODEL)
-        forward_kwargs: dict[str, Any] = {"model": chosen_model, "messages": messages, **kwargs}
+        filtered_messages, _, blocked = self._client._trust_gateway.filter_input(
+            messages,
+            system=system,
+        )
+        if blocked:
+            raise TrustGatewayError(
+                "AI Quality & Trust Gateway blocked unsafe input prompt."
+            )
+        chosen_model = (
+            self._client._router.choose(filtered_messages, system=system)
+            if auto_route
+            else (model or BASELINE_MODEL)
+        )
+        forward_kwargs: dict[str, Any] = {
+            "model": chosen_model,
+            "messages": filtered_messages,
+            **kwargs,
+        }
         if system is not None:
             forward_kwargs["system"] = system
         return self._client._anthropic.messages.stream(**forward_kwargs)
