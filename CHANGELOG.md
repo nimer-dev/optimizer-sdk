@@ -4,6 +4,20 @@ All notable changes to `nimer` (the Python SDK) will be documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-05-26
+
+### Added
+- `configure_otel_tracing()` — optional OTLP export helper for gateway traffic.
+- `RetryPolicy` and typed errors (`RateLimitError`, `BudgetExceededError`, …) on HTTP paths.
+- `nimer/_client_common.py` — shared sync/async core for `chat`, `ultrathink`, streaming, routing feedback.
+
+### Changed
+- `OptimizedClaude` / `AsyncNimer` refactored onto `_NimerBackendCore` (same public API).
+- `_SecretStr` masks repr only so Bearer auth still works with `str` keys.
+
+### Fixed
+- Per-request HTTP timeouts and connection reuse hardened (enterprise audit follow-up).
+
 ## [0.2.0] — 2026-05-10
 
 ### Added

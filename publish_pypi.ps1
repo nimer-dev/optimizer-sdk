@@ -1,4 +1,4 @@
-# PyPI release script for nimer 0.2.0
+# PyPI release script for nimer (reads version from nimer/_version.py)
 # Run after generating a token at https://pypi.org/manage/account/token/
 #
 # Usage:
